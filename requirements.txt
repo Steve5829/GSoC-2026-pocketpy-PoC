@@ -1,4 +1,5 @@
 fastapi
+pillow
 python-dotenv
 requests
 uvicorn
