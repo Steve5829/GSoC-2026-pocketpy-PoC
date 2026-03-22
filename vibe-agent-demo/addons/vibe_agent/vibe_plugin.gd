@@ -468,6 +468,21 @@ func _coerce_dynamic_value(value):
 
 func _coerce_args(args_value) -> Array:
 	if typeof(args_value) == TYPE_ARRAY:
+		if _is_numeric_array(args_value):
+			if args_value.size() == 2:
+				return [Vector2(float(args_value[0]), float(args_value[1]))]
+			if args_value.size() == 3:
+				return [Vector3(float(args_value[0]), float(args_value[1]), float(args_value[2]))]
+			if args_value.size() == 4:
+				var looks_like_color = true
+				for item in args_value:
+					var f = float(item)
+					if f < 0.0 or f > 1.0:
+						looks_like_color = false
+						break
+				if looks_like_color:
+					return [Color(float(args_value[0]), float(args_value[1]), float(args_value[2]), float(args_value[3]))]
+
 		var converted: Array = []
 		for item in args_value:
 			converted.append(_coerce_dynamic_value(item))
