@@ -387,33 +387,138 @@ def _apply_modification(image: Image.Image, plan: Dict[str, Any]) -> Image.Image
     raise ValueError("Unsupported modification action: " + str(action))
 
 
-def _plan_automation(prompt: str, selected_nodes: List[SelectedNode]) -> Dict[str, Any]:
+def _extract_name_pattern(prompt: str, default_pattern: str = "child_%d") -> str:
+    quoted_pattern = re.search(r'"([^"]+)"', prompt)
+    if quoted_pattern:
+        return quoted_pattern.group(1)
+    single_quoted = re.search(r"'([^']+)'", prompt)
+    if single_quoted:
+        return single_quoted.group(1)
+    return default_pattern
+
+
+def _extract_numeric_values(prompt: str) -> List[float]:
+    matches = re.findall(r"-?\d+(?:\.\d+)?", prompt)
+    return [float(match) for match in matches]
+
+
+def _fallback_automation_actions(prompt: str, selected_nodes: List[SelectedNode]) -> List[Dict[str, Any]]:
     if not selected_nodes:
         raise ValueError("Select at least one node before running automation")
 
     primary = selected_nodes[0]
-    quoted_pattern = re.search(r'"([^"]*%d[^"]*)"', prompt)
-    fallback = {
-        "action": "rename_children",
-        "target_node_path": primary.scene_path,
-        "pattern": quoted_pattern.group(1) if quoted_pattern else "child_%d",
-        "start_index": int(re.search(r"start(?:ing)?\s+from\s+(-?\d+)", prompt, flags=re.IGNORECASE).group(1))
-        if re.search(r"start(?:ing)?\s+from\s+(-?\d+)", prompt, flags=re.IGNORECASE)
-        else 0,
-    }
+    lower_prompt = prompt.lower()
+    name_pattern = _extract_name_pattern(prompt)
+
+    create_match = re.search(
+        r"create\s+(\d+)\s+([A-Za-z0-9_]+)\s+children",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    if create_match:
+        return [
+            {
+                "action": "create_node",
+                "params": {
+                    "target_node_path": primary.scene_path,
+                    "count": max(1, int(create_match.group(1))),
+                    "node_type": create_match.group(2),
+                    "name_pattern": name_pattern,
+                },
+            }
+        ]
+
+    rename_start_match = re.search(r"start(?:ing)?\s+from\s+(-?\d+)", prompt, flags=re.IGNORECASE)
+    if "rename" in lower_prompt and "children" in lower_prompt:
+        return [
+            {
+                "action": "rename_children",
+                "params": {
+                    "target_node_path": primary.scene_path,
+                    "pattern": name_pattern if "%d" in name_pattern else "child_%d",
+                    "start_index": int(rename_start_match.group(1)) if rename_start_match else 0,
+                },
+            }
+        ]
+
+    if "set position" in lower_prompt or "set_position" in lower_prompt:
+        values = _extract_numeric_values(prompt)
+        if primary.type.lower().endswith("3d") and len(values) >= 3:
+            return [
+                {
+                    "action": "set_position",
+                    "params": {
+                        "target_node_path": primary.scene_path,
+                        "args": [[values[0], values[1], values[2]]],
+                    },
+                }
+            ]
+        if len(values) >= 2:
+            return [
+                {
+                    "action": "set_position",
+                    "params": {
+                        "target_node_path": primary.scene_path,
+                        "args": [[values[0], values[1]]],
+                    },
+                }
+            ]
+
+    if "set name" in lower_prompt or "set_name" in lower_prompt:
+        match = re.search(r'"([^"]+)"', prompt) or re.search(r"'([^']+)'", prompt)
+        if match:
+            return [
+                {
+                    "action": "set_name",
+                    "params": {
+                        "target_node_path": primary.scene_path,
+                        "args": [match.group(1)],
+                    },
+                }
+            ]
+
+    return []
+
+
+def _normalize_automation_actions(actions: Any, fallback_actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(actions, list):
+        return fallback_actions
+
+    normalized: List[Dict[str, Any]] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+
+        action_type = str(action.get("action") or "").strip()
+        params = action.get("params", {})
+        if not action_type or not isinstance(params, dict):
+            continue
+
+        normalized.append({"action": action_type, "params": params})
+
+    return normalized or fallback_actions
+
+
+def _plan_automation(prompt: str, selected_nodes: List[SelectedNode]) -> List[Dict[str, Any]]:
+    fallback_actions = _fallback_automation_actions(prompt, selected_nodes)
 
     try:
         plan = _chat_json(
             (
                 "You convert Godot editor automation requests into structured actions. "
-                "Return JSON only. Allowed action is rename_children. "
-                "The response must contain action, target_node_path, pattern, and start_index. "
-                "pattern must include %d."
+                "Return JSON only. The root object must contain an actions array. "
+                "Each action item must look like {\"action\": \"name\", \"params\": {...}}. "
+                "For direct node operations, use the Godot method name as the action and put target_node_path and args in params. "
+                "Example direct node action: {\"action\": \"set_name\", \"params\": {\"target_node_path\": \".\", \"args\": [\"Player\"]}}. "
+                "For generic editor commands that are not a single node method, use abstract action names such as create_node or rename_children. "
+                "Example create action: {\"action\": \"create_node\", \"params\": {\"target_node_path\": \".\", \"node_type\": \"Node3D\", \"count\": 10, \"name_pattern\": \"child_%d\"}}. "
+                "Example rename action: {\"action\": \"rename_children\", \"params\": {\"target_node_path\": \".\", \"pattern\": \"child_%d\", \"start_index\": 0}}. "
+                "Do not wrap params fields at the top level. Keep everything under params."
             ),
             {
                 "prompt": prompt,
                 "selected_nodes": [node.dict() for node in selected_nodes],
-                "fallback": fallback,
+                "fallback": {"actions": fallback_actions},
             },
         )
     except Exception as exc:
@@ -421,18 +526,9 @@ def _plan_automation(prompt: str, selected_nodes: List[SelectedNode]) -> Dict[st
         plan = None
 
     if not isinstance(plan, dict):
-        return fallback
+        return fallback_actions
 
-    pattern = str(plan.get("pattern") or fallback["pattern"])
-    if "%d" not in pattern:
-        pattern = fallback["pattern"]
-
-    return {
-        "action": str(plan.get("action") or fallback["action"]),
-        "target_node_path": str(plan.get("target_node_path") or fallback["target_node_path"]),
-        "pattern": pattern,
-        "start_index": int(plan.get("start_index") or fallback["start_index"]),
-    }
+    return _normalize_automation_actions(plan.get("actions"), fallback_actions)
 
 
 @app.post("/vibe/generate")
@@ -523,14 +619,14 @@ async def automate_editor(request: AutomationRequest) -> Dict[str, Any]:
     print("Automating editor action for prompt:", request.prompt)
 
     try:
-        action = _plan_automation(request.prompt, request.selected_nodes)
-        if action.get("action") != "rename_children":
-            return _error("Unsupported automation action: %s" % action.get("action", "unknown"))
+        actions = _plan_automation(request.prompt, request.selected_nodes)
+        if not actions:
+            return _error("Automation planner returned no supported actions")
 
         return {
             "status": "success",
             "type": "automation",
-            "action": action,
+            "actions": actions,
             "message": "Automation plan ready",
         }
     except Exception as exc:
